@@ -25,24 +25,22 @@ const CLEAN_ANYCAST_POOLS = {
   ]
 };
 
-export default {
-  // 定时探活更新 ProxyIP 质量
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(refreshProxyIpPool(env));
-  },
+// 优质 ProxyIP 池（用于接管 Cloudflare 自身域名/测速点，消除 1003 回环拦截）
+const BACKUP_PROXY_IPS = ["cdn.anycast.eu.org", "proxyip.fxxk.dedyn.io", "worker-proxyip.us.kg"];
 
-  async fetch(request, env, ctx) {
+export default {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const targetUUID = env.UUID || DEFAULT_UUID;
     const upgradeHeader = request.headers.get('Upgrade');
 
-    // 1. WebSocket 流量进入 VLESS 协议管道
+    // 1. WebSocket 协议管道处理
     if (upgradeHeader && upgradeHeader.toLowerCase() === 'websocket') {
       const webSocketPair = new WebSocketPair();
       const [clientWs, serverWs] = Object.values(webSocketPair);
       serverWs.accept();
 
-      handleVlessPipeline(serverWs, targetUUID, env);
+      handleVlessSession(serverWs, targetUUID, env);
 
       return new Response(null, {
         status: 101,
@@ -79,7 +77,7 @@ export default {
       return new Response(text, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
     }
 
-    // 4. 返回日系二次元极客控制台
+    // 4. 返回控制台界面
     return new Response(renderTacticalDashboardHtml(url.hostname, targetUUID, clientNet), {
       headers: { "Content-Type": "text/html; charset=utf-8" }
     });
@@ -87,69 +85,83 @@ export default {
 };
 
 /**
- * VLESS 传输管道核心实现
+ * 工业级单锁长连接 VLESS 转发管道（彻底消除 Stream Locked 崩溃）
  */
-async function handleVlessPipeline(ws, targetUUID, env) {
+async function handleVlessSession(ws, targetUUID, env) {
   let remoteSocket = null;
+  let socketWriter = null;
   let isHeaderParsed = false;
 
   ws.addEventListener('message', async (event) => {
     try {
-      if (!isHeaderParsed) {
-        const buffer = event.data;
-        if (!(buffer instanceof ArrayBuffer)) return;
+      const chunk = event.data;
+      if (!(chunk instanceof ArrayBuffer)) return;
 
-        const { hasError, message, address, port, rawIndex } = parseVlessHeader(buffer, targetUUID);
+      if (!isHeaderParsed) {
+        isHeaderParsed = true;
+
+        const { hasError, message, address, port, rawIndex } = parseVlessHeader(chunk, targetUUID);
         if (hasError) {
           ws.close(1008, message);
           return;
         }
 
-        isHeaderParsed = true;
-
-        // 动态 ProxyIP 决策：绕过目标站对 CF 节点的阻断
-        const outboundHost = await resolveOutboundHost(address, env);
+        // 核心技术：防回环拦截调度。若访问 CF 自身服务（如 v2rayNG 测速使用的 cp.cloudflare.com），自动切至 ProxyIP
+        let outboundHost = address;
+        if (isCloudflareDomainOrIp(address)) {
+          outboundHost = BACKUP_PROXY_IPS[Math.floor(Math.random() * BACKUP_PROXY_IPS.length)];
+        }
 
         remoteSocket = connect({
           hostname: outboundHost,
           port: port
         });
 
-        // 响应 VLESS 成功握手帧 (版本 0)
+        // 保持单 Writer 实例贯穿整个长连接生命周期，彻底规避重复 getWriter 报错
+        socketWriter = remoteSocket.writable.getWriter();
+
+        // 响应 VLESS 协议握手成功响应帧 (0x00, 0x00)
         ws.send(new Uint8Array([0, 0]));
 
-        // 发送客户端首包中的 Payload
-        const initialPayload = buffer.slice(rawIndex);
+        // 发送初始载荷
+        const initialPayload = chunk.slice(rawIndex);
         if (initialPayload.byteLength > 0) {
-          const writer = remoteSocket.writable.getWriter();
-          await writer.write(new Uint8Array(initialPayload));
-          writer.releaseLock();
+          await socketWriter.write(new Uint8Array(initialPayload));
         }
 
-        // 建立双向流中继
+        // 开启远端 TCP 数据向客户端 WebSocket 的回传管道
         pipeRemoteToWebSocket(remoteSocket, ws);
       } else {
-        if (remoteSocket && event.data instanceof ArrayBuffer) {
-          const writer = remoteSocket.writable.getWriter();
-          await writer.write(new Uint8Array(event.data));
-          writer.releaseLock();
+        // 后续数据直推管道
+        if (socketWriter) {
+          await socketWriter.write(new Uint8Array(chunk));
         }
       }
     } catch (err) {
+      if (socketWriter) {
+        try { socketWriter.releaseLock(); } catch (e) {}
+      }
       if (remoteSocket) remoteSocket.close();
       ws.close(1011, err.message);
     }
   });
 
-  ws.addEventListener('close', () => { if (remoteSocket) remoteSocket.close(); });
-  ws.addEventListener('error', () => { if (remoteSocket) remoteSocket.close(); });
+  const cleanup = () => {
+    if (socketWriter) {
+      try { socketWriter.releaseLock(); } catch (e) {}
+    }
+    if (remoteSocket) remoteSocket.close();
+  };
+
+  ws.addEventListener('close', cleanup);
+  ws.addEventListener('error', cleanup);
 }
 
 /**
  * VLESS 头部解包校验
  */
 function parseVlessHeader(buffer, expectedUUID) {
-  if (buffer.byteLength < 24) return { hasError: true, message: 'Invalid payload' };
+  if (buffer.byteLength < 24) return { hasError: true, message: 'Invalid payload length' };
 
   const view = new DataView(buffer);
   if (view.getUint8(0) !== 0) return { hasError: true, message: 'Version mismatch' };
@@ -176,7 +188,7 @@ function parseVlessHeader(buffer, expectedUUID) {
 
   const command = view.getUint8(cursor); // 1 = TCP
   cursor += 1;
-  if (command !== 1) return { hasError: true, message: 'TCP only' };
+  if (command !== 1) return { hasError: true, message: 'TCP only supported' };
 
   const port = view.getUint16(cursor);
   cursor += 2;
@@ -201,14 +213,14 @@ function parseVlessHeader(buffer, expectedUUID) {
     address = parts.join(':');
     cursor += 16;
   } else {
-    return { hasError: true, message: 'Unknown address' };
+    return { hasError: true, message: 'Unknown address type' };
   }
 
   return { hasError: false, address, port, rawIndex: cursor };
 }
 
 /**
- * 远程 TCP Socket 管道读取写入 WebSocket
+ * 远程 TCP Socket 管道读取写入 WebSocket (精准字节切片)
  */
 async function pipeRemoteToWebSocket(remoteSocket, ws) {
   const reader = remoteSocket.readable.getReader();
@@ -217,7 +229,8 @@ async function pipeRemoteToWebSocket(remoteSocket, ws) {
       const { value, done } = await reader.read();
       if (done) break;
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(value.buffer);
+        // 直接传递 Uint8Array，避免 buffer 未切片溢出
+        ws.send(value);
       }
     }
   } catch (e) {
@@ -228,52 +241,19 @@ async function pipeRemoteToWebSocket(remoteSocket, ws) {
 }
 
 /**
- * 智能出站路由：动态调度 ProxyIP 池
+ * 检测目标是否属于 Cloudflare 自身网络（消除 1003 回环拦截）
  */
-async function resolveOutboundHost(targetHost, env) {
-  let proxyPool = [];
-  if (env.NODE_KV) {
-    try {
-      const kvList = await env.NODE_KV.get('active_proxy_ips', 'json');
-      if (Array.isArray(kvList) && kvList.length > 0) proxyPool = kvList;
-    } catch (e) {}
-  }
-
-  if (proxyPool.length === 0) {
-    const defaultStr = env.DEFAULT_PROXY_IPS || "cdn.anycast.eu.org,proxyip.fxxk.dedyn.io";
-    proxyPool = defaultStr.split(',').map(s => s.trim()).filter(Boolean);
-  }
-
-  const hash = targetHost.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
-  const selectedProxy = proxyPool[hash % proxyPool.length];
-
-  if (targetHost.includes('workers.dev') || targetHost.includes('pages.dev')) {
-    return selectedProxy;
-  }
-
-  return targetHost;
-}
-
-/**
- * 定时探活 ProxyIP
- */
-async function refreshProxyIpPool(env) {
-  if (!env.NODE_KV) return;
-  const rawIps = (env.DEFAULT_PROXY_IPS || "").split(',').map(s => s.trim()).filter(Boolean);
-  const aliveIps = [];
-
-  for (const host of rawIps) {
-    try {
-      const sock = connect({ hostname: host, port: 443 });
-      await sock.opened;
-      aliveIps.push(host);
-      sock.close();
-    } catch (e) {}
-  }
-
-  if (aliveIps.length > 0) {
-    await env.NODE_KV.put('active_proxy_ips', JSON.stringify(aliveIps));
-  }
+function isCloudflareDomainOrIp(target) {
+  const lower = (target || '').toLowerCase();
+  return (
+    lower.includes('cloudflare.com') ||
+    lower.includes('cloudflare.net') ||
+    lower.includes('workers.dev') ||
+    lower.includes('pages.dev') ||
+    lower.startsWith('104.') ||
+    lower.startsWith('172.67.') ||
+    lower.startsWith('162.159.')
+  );
 }
 
 /**
@@ -303,9 +283,6 @@ function parseClientCarrier(cf, request) {
   return { clientIp, country, city, asn, org: cf.asOrganization || "N/A", carrierName, carrierKey };
 }
 
-/**
- * 生成 Clash.Meta 配置文件 (纯字符串拼接，杜绝模板嵌套错误)
- */
 function generateClashYaml(hostname, uuid, remark, client) {
   const prefix = remark || "TACTICAL-CF";
   const pool = CLEAN_ANYCAST_POOLS[client.carrierKey] || CLEAN_ANYCAST_POOLS.global;
@@ -366,9 +343,6 @@ function generateClashYaml(hostname, uuid, remark, client) {
   ].join("\n");
 }
 
-/**
- * 生成 Sing-box JSON 配置文件
- */
 function generateSingboxJson(hostname, uuid, remark, client) {
   const prefix = remark || "TACTICAL-CF";
   const pool = CLEAN_ANYCAST_POOLS[client.carrierKey] || CLEAN_ANYCAST_POOLS.global;
@@ -401,7 +375,7 @@ function generateSingboxJson(hostname, uuid, remark, client) {
     log: { level: "info" },
     inbounds: [{ type: "mixed", tag: "mixed-in", listen: "127.0.0.1", listen_port: 2080 }],
     outbounds: [
-      { type: "urltest", tag: "AUTO-FASTEST", outbounds: allTags, url: "http://cp.cloudflare.com/generate_204", interval: "3m" },
+      { type: "urltest", tag: "AUTO-FASTEST", outbounds: allTags, url: "http://www.gstatic.com/generate_204", interval: "3m" },
       ...outbounds,
       { type: "direct", tag: "direct" }
     ],
@@ -409,9 +383,6 @@ function generateSingboxJson(hostname, uuid, remark, client) {
   }, null, 2);
 }
 
-/**
- * 生成标准 Base64 订阅 URI
- */
 function generateBase64Sub(hostname, uuid, remark, client) {
   const prefix = remark || "TACTICAL-CF";
   const pool = CLEAN_ANYCAST_POOLS[client.carrierKey] || CLEAN_ANYCAST_POOLS.global;
@@ -424,9 +395,6 @@ function generateBase64Sub(hostname, uuid, remark, client) {
   return btoa(lines.join('\n'));
 }
 
-/**
- * 日系二次元高通透战术仪表盘 HTML
- */
 function renderTacticalDashboardHtml(hostname, uuid, client) {
   const pool = CLEAN_ANYCAST_POOLS[client.carrierKey] || CLEAN_ANYCAST_POOLS.global;
   const vlessMainUri = "vless://" + uuid + "@" + pool[0].ip + ":" + pool[0].port +
