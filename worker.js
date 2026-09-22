@@ -560,4 +560,80 @@ function renderTacticalDashboardHtml(hostname, uuid, client) {
         <div class="item-row"><span class="item-label">接入地区 / 城市</span><span class="item-val">${client.country} - ${client.city}</span></div>
         <div class="item-row"><span class="item-label">自治系统 (ASN)</span><span class="item-val">AS${client.asn}</span></div>
         <div class="item-row"><span class="item-label">识别运营商</span><span class="item-val" style="color:var(--pink); font-weight:700;">${client.carrierName}</span></div>
-        <div class="item-row"><span class="item-label">出站中继洗白引擎</span><span class="item-val" 
+        <div class="item-row"><span class="item-label">出站中继洗白引擎</span><span class="item-val" style="color:#10b981;">ACTIVE (ProxyIP)</span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">⚡ 全客户端多协议订阅导出</div>
+        <div class="sub-box">
+          <a class="sub-btn" href="/clash" target="_blank">
+            <span>🐱 Clash.Meta (Mihomo) 配置</span><span style="font-family:monospace;">/clash</span>
+          </a>
+          <a class="sub-btn" href="/singbox" target="_blank">
+            <span>📦 Sing-box 原生 JSON 订阅</span><span style="font-family:monospace;">/singbox</span>
+          </a>
+          <a class="sub-btn" href="/sub" target="_blank">
+            <span>🚀 通用 Base64 订阅 (v2rayN/小火箭)</span><span style="font-family:monospace;">/sub</span>
+          </a>
+          <a class="sub-btn" href="/ips.txt" target="_blank">
+            <span>📄 运营商纯净 Anycast IP 列表</span><span style="font-family:monospace;">/ips.txt</span>
+          </a>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:20px;">
+      <div class="card-title">🔗 专属于【${client.carrierName}】的 Anycast 最优节点池</div>
+      <table>
+        <thead>
+          <tr>
+            <th>序号</th>
+            <th>Anycast 边缘 IP</th>
+            <th>端口</th>
+            <th>路由区域</th>
+            <th>实测握手时延</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${ipTableRows}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-title">📝 节点 URI 明文备忘</div>
+      <div class="uri-code" id="vlessUri">${vlessMainUri}</div>
+      <button class="btn btn-cyan" onclick="copyText(document.getElementById('vlessUri').innerText)">复制上方 VLESS URI 并在客户端直接导入</button>
+    </div>
+  </div>
+
+  <script>
+    const LANDSCAPE = [
+      "https://t.alcy.cc/ycy",
+      "https://api.btstu.cn/sjbz/api.php?lx=dongman&format=images",
+      "https://pic.re/image"
+    ];
+    const PORTRAIT = [
+      "https://t.alcy.cc/mp",
+      "https://api.btstu.cn/sjbz/api.php?lx=m_dongman&format=images"
+    ];
+    let wpIdx = 0;
+    function loadWallpaper() {
+      const isMobile = window.innerWidth <= 768 || window.innerHeight > window.innerWidth;
+      const list = isMobile ? PORTRAIT : LANDSCAPE;
+      const url = list[wpIdx % list.length] + "?t=" + Date.now();
+      const img = new Image();
+      img.src = url;
+      img.onload = () => { document.getElementById('bg').style.backgroundImage = "url('" + url + "')"; };
+    }
+    function switchWp() { wpIdx++; loadWallpaper(); }
+    function copyText(txt) {
+      navigator.clipboard.writeText(txt).then(() => alert('已复制到剪贴板！'));
+    }
+    window.addEventListener('resize', loadWallpaper);
+    loadWallpaper();
+  </script>
+</body>
+</html>`;
+}
