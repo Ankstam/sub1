@@ -1,10 +1,6 @@
-name = "cf-node-tactical"
+name = "cf-vless-node"
 main = "worker.js"
 compatibility_date = "2026-09-20"
 
 [vars]
-# 节点核心认证 UUID
 UUID = "d342d11e-d424-4583-b36e-524ab1f0afa4"
-
-# 备用出站中继 IP (当目标站点与 Cloudflare 存在回环冲突时自动启用)
-PROXYIP = "cdn.anycast.eu.org"
