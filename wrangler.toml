@@ -1,0 +1,23 @@
+name = "cf-node-ceiling"
+main = "worker.js"
+compatibility_date = "2026-09-20"
+compatibility_flags = ["nodejs_compat"]
+
+# 绑定 KV 存储（用于持久化动态 ProxyIP 探活池与自定义路由规则）
+[[kv_namespaces]]
+binding = "NODE_KV"
+id = "b55794bd2ca54971ba37a87d3b7a32a5"
+
+# 定时调度：每 6 小时自动探活并刷新 ProxyIP 出口池可用性
+[triggers]
+crons = ["0 */6 * * *"]
+
+[vars]
+# 节点核心认证 UUID（可使用任意 UUID v4）
+UUID = "d342d11e-d424-4583-b36e-524ab1f0afa4"
+
+# 默认出站 ProxyIP 备用池（逗号分隔，用于绕过目标站对 CF 出口 IP 的风控拦截）
+DEFAULT_PROXY_IPS = "cdn.anycast.eu.org,proxyip.fxxk.dedyn.io,worker-proxyip.us.kg"
+
+# 订阅节点名称前缀
+NODE_REMARK = "TACTICAL-CF"
