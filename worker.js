@@ -2,7 +2,7 @@ import { connect } from 'cloudflare:sockets';
 
 const DEFAULT_UUID = 'd342d11e-d424-4583-b36e-524ab1f0afa4';
 
-// 预设各运营商低时延 Anycast 入口优选池
+// 预设各大运营商低延迟 Anycast 优质节点
 const CLEAN_ANYCAST_POOLS = {
   telecom: [
     { ip: "162.159.193.10", port: 443, isp: "中国电信", region: "中国香港", latency: "38ms" },
@@ -36,7 +36,7 @@ export default {
     const targetUUID = env.UUID || DEFAULT_UUID;
     const upgradeHeader = request.headers.get('Upgrade');
 
-    // 1. WebSocket 流量：进入 VLESS 协议管道
+    // 1. WebSocket 流量进入 VLESS 协议管道
     if (upgradeHeader && upgradeHeader.toLowerCase() === 'websocket') {
       const webSocketPair = new WebSocketPair();
       const [clientWs, serverWs] = Object.values(webSocketPair);
@@ -55,35 +55,31 @@ export default {
     const clientNet = parseClientCarrier(cf, request);
 
     // 3. 订阅输出接口
-    // A. Clash.Meta / Mihomo 订阅
     if (url.pathname === '/clash') {
       return new Response(generateClashYaml(url.hostname, targetUUID, env.NODE_REMARK, clientNet), {
         headers: { "Content-Type": "text/yaml; charset=utf-8" }
       });
     }
 
-    // B. Sing-box JSON 订阅
     if (url.pathname === '/singbox') {
       return new Response(generateSingboxJson(url.hostname, targetUUID, env.NODE_REMARK, clientNet), {
         headers: { "Content-Type": "application/json; charset=utf-8" }
       });
     }
 
-    // C. 通用 Base64 订阅 (/sub)
     if (url.pathname === '/sub') {
       return new Response(generateBase64Sub(url.hostname, targetUUID, env.NODE_REMARK, clientNet), {
         headers: { "Content-Type": "text/plain; charset=utf-8" }
       });
     }
 
-    // D. 优选 IP 列表纯文本 (/ips.txt)
     if (url.pathname === '/ips.txt') {
       const pool = CLEAN_ANYCAST_POOLS[clientNet.carrierKey] || CLEAN_ANYCAST_POOLS.global;
-      const text = pool.map(item => `${item.ip}:${item.port}#${item.isp}-${item.region}`).join('\n');
+      const text = pool.map(item => item.ip + ":" + item.port + "#" + item.isp + "-" + item.region).join('\n');
       return new Response(text, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
     }
 
-    // 4. 默认返回日系二次元极客控制台
+    // 4. 返回日系二次元极客控制台
     return new Response(renderTacticalDashboardHtml(url.hostname, targetUUID, clientNet), {
       headers: { "Content-Type": "text/html; charset=utf-8" }
     });
@@ -111,8 +107,7 @@ async function handleVlessPipeline(ws, targetUUID, env) {
 
         isHeaderParsed = true;
 
-        // 核心技术：动态 ProxyIP 决策
-        // 若目标为 Cloudflare 自身 IP 或被风控域名，走 ProxyIP 池出站，避免 1003 错误或 Recaptcha 拦截
+        // 动态 ProxyIP 决策：绕过目标站对 CF 节点的阻断
         const outboundHost = await resolveOutboundHost(address, env);
 
         remoteSocket = connect({
@@ -120,7 +115,7 @@ async function handleVlessPipeline(ws, targetUUID, env) {
           port: port
         });
 
-        // 响应 VLESS 成功握手帧 (版本 0, 0 附加信息)
+        // 响应 VLESS 成功握手帧 (版本 0)
         ws.send(new Uint8Array([0, 0]));
 
         // 发送客户端首包中的 Payload
@@ -134,7 +129,6 @@ async function handleVlessPipeline(ws, targetUUID, env) {
         // 建立双向流中继
         pipeRemoteToWebSocket(remoteSocket, ws);
       } else {
-        // 后续数据直通 TCP Socket
         if (remoteSocket && event.data instanceof ArrayBuffer) {
           const writer = remoteSocket.writable.getWriter();
           await writer.write(new Uint8Array(event.data));
@@ -160,7 +154,6 @@ function parseVlessHeader(buffer, expectedUUID) {
   const view = new DataView(buffer);
   if (view.getUint8(0) !== 0) return { hasError: true, message: 'Version mismatch' };
 
-  // 校验 UUID
   const idBytes = new Uint8Array(buffer.slice(1, 17));
   const hexArr = [];
   for (let i = 0; i < 16; i++) {
@@ -181,7 +174,7 @@ function parseVlessHeader(buffer, expectedUUID) {
   const optLen = view.getUint8(17);
   let cursor = 18 + optLen;
 
-  const command = view.getUint8(cursor); // 1 = TCP, 2 = UDP
+  const command = view.getUint8(cursor); // 1 = TCP
   cursor += 1;
   if (command !== 1) return { hasError: true, message: 'TCP only' };
 
@@ -193,17 +186,14 @@ function parseVlessHeader(buffer, expectedUUID) {
 
   let address = '';
   if (addrType === 1) {
-    // IPv4
     address = [view.getUint8(cursor), view.getUint8(cursor + 1), view.getUint8(cursor + 2), view.getUint8(cursor + 3)].join('.');
     cursor += 4;
   } else if (addrType === 2) {
-    // 域名
     const dLen = view.getUint8(cursor);
     cursor += 1;
     address = new TextDecoder().decode(new Uint8Array(buffer.slice(cursor, cursor + dLen)));
     cursor += dLen;
   } else if (addrType === 3) {
-    // IPv6
     const parts = [];
     for (let i = 0; i < 8; i++) {
       parts.push(view.getUint16(cursor + i * 2).toString(16));
@@ -218,7 +208,7 @@ function parseVlessHeader(buffer, expectedUUID) {
 }
 
 /**
- * 远程 TCP Socket 管道读取打入 WebSocket
+ * 远程 TCP Socket 管道读取写入 WebSocket
  */
 async function pipeRemoteToWebSocket(remoteSocket, ws) {
   const reader = remoteSocket.readable.getReader();
@@ -241,7 +231,6 @@ async function pipeRemoteToWebSocket(remoteSocket, ws) {
  * 智能出站路由：动态调度 ProxyIP 池
  */
 async function resolveOutboundHost(targetHost, env) {
-  // 如果直接访问私有地址或需要被中继的节点，从 ProxyIP 池选出活跃 IP
   let proxyPool = [];
   if (env.NODE_KV) {
     try {
@@ -255,11 +244,9 @@ async function resolveOutboundHost(targetHost, env) {
     proxyPool = defaultStr.split(',').map(s => s.trim()).filter(Boolean);
   }
 
-  // 针对特定网站或高阻断目标随机挑选 ProxyIP 进行流量洗白
   const hash = targetHost.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
   const selectedProxy = proxyPool[hash % proxyPool.length];
 
-  // 若访问自身域名或 Cloudflare IP，强制使用 ProxyIP 防环路
   if (targetHost.includes('workers.dev') || targetHost.includes('pages.dev')) {
     return selectedProxy;
   }
@@ -317,59 +304,66 @@ function parseClientCarrier(cf, request) {
 }
 
 /**
- * 生成 Clash.Meta (Mihomo) 配置文件
+ * 生成 Clash.Meta 配置文件 (纯字符串拼接，杜绝模板嵌套错误)
  */
 function generateClashYaml(hostname, uuid, remark, client) {
   const prefix = remark || "TACTICAL-CF";
   const pool = CLEAN_ANYCAST_POOLS[client.carrierKey] || CLEAN_ANYCAST_POOLS.global;
 
-  const proxies = pool.map((p, idx) => `  - name: "${prefix}-${p.isp}-${p.region}-${idx + 1}"
-    type: vless
-    server: ${p.ip}
-    port: ${p.port}
-    uuid: ${uuid}
-    cipher: none
-    tls: true
-    servername: ${hostname}
-    network: ws
-    ws-opts:
-      path: /
-      headers:
-        Host: ${hostname}
-    smux:
-      enabled: true
-      protocol: h2mux
-      max-connections: 4`).join('\n');
+  const proxies = pool.map((p, idx) => {
+    const nodeName = prefix + "-" + p.isp + "-" + p.region + "-" + (idx + 1);
+    return [
+      "  - name: \"" + nodeName + "\"",
+      "    type: vless",
+      "    server: " + p.ip,
+      "    port: " + p.port,
+      "    uuid: " + uuid,
+      "    cipher: none",
+      "    tls: true",
+      "    servername: " + hostname,
+      "    network: ws",
+      "    ws-opts:",
+      "      path: /",
+      "      headers:",
+      "        Host: " + hostname,
+      "    smux:",
+      "      enabled: true",
+      "      protocol: h2mux",
+      "      max-connections: 4"
+    ].join("\n");
+  }).join("\n");
 
-  const proxyNames = pool.map((p, idx) => `      - "${prefix}-${p.isp}-${p.region}-${idx + 1}"`).join('\n');
+  const proxyNames = pool.map((p, idx) => "      - \"" + prefix + "-" + p.isp + "-" + p.region + "-" + (idx + 1) + "\"").join("\n");
 
-  return `port: 7890
-socks-port: 7891
-allow-lan: false
-mode: rule
-log-level: info
-
-proxies:
-${proxies}
-
-proxy-groups:
-  - name: "AUTO-FASTEST"
-    type: url-test
-    url: http://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
-    proxies:
-${proxyNames}
-
-  - name: "TACTICAL-PROXY"
-    type: select
-    proxies:
-      - "AUTO-FASTEST"
-${proxyNames}
-
-rules:
-  - MATCH,TACTICAL-PROXY
-`;
+  return [
+    "port: 7890",
+    "socks-port: 7891",
+    "allow-lan: false",
+    "mode: rule",
+    "log-level: info",
+    "",
+    "proxies:",
+    proxies,
+    "",
+    "proxy-groups:",
+    "  - name: \"AUTO-FASTEST\"",
+    "    type: url-test",
+    "    url: http://www.gstatic.com/generate_204",
+    "    interval: 300",
+    "    tolerance: 50",
+    "    proxies:",
+    proxyNames,
+    "",
+    "  - name: \"TACTICAL-PROXY\"",
+    "    type: select",
+    "    proxies:",
+    "      - \"AUTO-FASTEST\"",
+    proxyNames,
+    "",
+    "rules:",
+    "  - MATCH,TACTICAL-PROXY",
+    ""
+  ].join("\n");
 }
 
 /**
@@ -381,7 +375,7 @@ function generateSingboxJson(hostname, uuid, remark, client) {
 
   const outbounds = pool.map((p, idx) => ({
     type: "vless",
-    tag: `${prefix}-${p.isp}-${p.region}-${idx + 1}`,
+    tag: prefix + "-" + p.isp + "-" + p.region + "-" + (idx + 1),
     server: p.ip,
     server_port: p.port,
     uuid: uuid,
@@ -403,30 +397,16 @@ function generateSingboxJson(hostname, uuid, remark, client) {
 
   const allTags = outbounds.map(o => o.tag);
 
-  const fullConfig = {
+  return JSON.stringify({
     log: { level: "info" },
-    inbounds: [
-      { type: "mixed", tag: "mixed-in", listen: "127.0.0.1", listen_port: 2080 }
-    ],
+    inbounds: [{ type: "mixed", tag: "mixed-in", listen: "127.0.0.1", listen_port: 2080 }],
     outbounds: [
-      {
-        type: "urltest",
-        tag: "AUTO-FASTEST",
-        outbounds: allTags,
-        url: "http://cp.cloudflare.com/generate_204",
-        interval: "3m"
-      },
+      { type: "urltest", tag: "AUTO-FASTEST", outbounds: allTags, url: "http://cp.cloudflare.com/generate_204", interval: "3m" },
       ...outbounds,
       { type: "direct", tag: "direct" }
     ],
-    route: {
-      rules: [
-        { outbound: "AUTO-FASTEST" }
-      ]
-    }
-  };
-
-  return JSON.stringify(fullConfig, null, 2);
+    route: { rules: [{ outbound: "AUTO-FASTEST" }] }
+  }, null, 2);
 }
 
 /**
@@ -436,7 +416,10 @@ function generateBase64Sub(hostname, uuid, remark, client) {
   const prefix = remark || "TACTICAL-CF";
   const pool = CLEAN_ANYCAST_POOLS[client.carrierKey] || CLEAN_ANYCAST_POOLS.global;
   const lines = pool.map((p, idx) => {
-    return `vless://${uuid}@${p.ip}:${p.port}?encryption=none&security=tls&sni=${hostname}&type=ws&host=${hostname}&path=%2F#${encodeURIComponent(`${prefix}-${p.isp}-${p.region}-${idx + 1}`)}`;
+    const tag = prefix + "-" + p.isp + "-" + p.region + "-" + (idx + 1);
+    return "vless://" + uuid + "@" + p.ip + ":" + p.port +
+      "?encryption=none&security=tls&sni=" + hostname +
+      "&type=ws&host=" + hostname + "&path=%2F#" + encodeURIComponent(tag);
   });
   return btoa(lines.join('\n'));
 }
@@ -446,46 +429,41 @@ function generateBase64Sub(hostname, uuid, remark, client) {
  */
 function renderTacticalDashboardHtml(hostname, uuid, client) {
   const pool = CLEAN_ANYCAST_POOLS[client.carrierKey] || CLEAN_ANYCAST_POOLS.global;
-  const vlessMainUri = `vless://${uuid}@${pool[0].ip}:${pool[0].port}?encryption=none&security=tls&sni=${hostname}&type=ws&host=${hostname}&path=%2F#TACTICAL-NODE-${client.carrierKey.toUpperCase()}`;
+  const vlessMainUri = "vless://" + uuid + "@" + pool[0].ip + ":" + pool[0].port +
+    "?encryption=none&security=tls&sni=" + hostname +
+    "&type=ws&host=" + hostname + "&path=%2F#TACTICAL-NODE-" + client.carrierKey.toUpperCase();
 
-  const ipTableRows = pool.map((item, idx) => `
-    <tr>
-      <td>${idx + 1}</td>
-      <td style="font-family:monospace; color:#00f0ff; font-weight:700;">${item.ip}</td>
-      <td><span class="badge-port">${item.port}</span></td>
-      <td>${item.region}</td>
-      <td style="color:#10b981; font-weight:600;">${item.latency}</td>
-      <td><button class="btn-copy" onclick="copyText('${item.ip}')">复制IP</button></td>
-    </tr>
-  `).join('');
+  const ipTableRows = pool.map((item, idx) => {
+    return '<tr>' +
+      '<td>' + (idx + 1) + '</td>' +
+      '<td style="font-family:monospace; color:#00f0ff; font-weight:700;">' + item.ip + '</td>' +
+      '<td><span class="badge-port">' + item.port + '</span></td>' +
+      '<td>' + item.region + '</td>' +
+      '<td style="color:#10b981; font-weight:600;">' + item.latency + '</td>' +
+      '<td><button class="btn-copy" onclick="copyText(\'' + item.ip + '\')">复制IP</button></td>' +
+    '</tr>';
+  }).join('');
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <title>TACTICAL ANYCAST NODE // 天花板控制台</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=M+PLUS+Rounded+1c:wght@700;800&family=Noto+Sans+SC:wght@500;700&display=swap" rel="stylesheet">
+  <title>TACTICAL ANYCAST NODE // 控制台</title>
   <style>
     :root {
       --pink: #ff6b9d;
-      --pink-glow: rgba(255, 107, 157, 0.45);
       --cyan: #00f0ff;
-      --cyan-glow: rgba(0, 240, 255, 0.4);
-      --glass-bg: rgba(10, 14, 26, 0.42);
-      --glass-border: rgba(255, 255, 255, 0.16);
+      --glass-bg: rgba(10, 14, 26, 0.45);
+      --glass-border: rgba(255, 255, 255, 0.18);
       --text: #f8fafc;
       --muted: #cbd5e1;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      background-color: #080c14;
-      color: var(--text);
-      font-family: 'Noto Sans SC', 'M PLUS Rounded 1c', sans-serif;
-      min-height: 100vh;
-      overflow-x: hidden;
+      background-color: #080c14; color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh; overflow-x: hidden;
     }
     #bg {
       position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: -2;
@@ -495,7 +473,7 @@ function renderTacticalDashboardHtml(hostname, uuid, client) {
     .overlay {
       position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: -1;
       background: linear-gradient(180deg, rgba(8, 12, 20, 0.3) 0%, rgba(10, 14, 24, 0.5) 60%, rgba(8, 12, 20, 0.7) 100%);
-      backdrop-filter: blur(1.5px);
+      backdrop-filter: blur(2px);
     }
     .container { max-width: 980px; margin: 0 auto; padding: 20px 16px 50px; }
     header {
@@ -509,22 +487,19 @@ function renderTacticalDashboardHtml(hostname, uuid, client) {
     }
     .brand { display: flex; align-items: center; gap: 12px; }
     .badge-tag {
-      font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700;
-      color: #fff; background: linear-gradient(135deg, var(--pink), #9d4edd);
-      padding: 3px 8px; border-radius: 6px; box-shadow: 0 0 12px var(--pink-glow);
+      font-family: monospace; font-size: 11px; font-weight: 700; color: #fff;
+      background: linear-gradient(135deg, var(--pink), #9d4edd);
+      padding: 3px 8px; border-radius: 6px;
     }
     .btn {
       background: linear-gradient(135deg, var(--pink), #e11d48); color: #fff; border: none;
       padding: 8px 14px; border-radius: 8px; font-size: 12.5px; font-weight: 700; cursor: pointer;
-      display: inline-flex; align-items: center; gap: 6px; box-shadow: 0 4px 14px var(--pink-glow);
-      transition: all 0.2s;
+      display: inline-flex; align-items: center; gap: 6px; transition: all 0.2s;
     }
-    .btn:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(255, 107, 157, 0.6); }
+    .btn:hover { transform: translateY(-2px); }
     .btn-cyan {
       background: rgba(10, 14, 26, 0.6); color: var(--cyan); border: 1px solid rgba(0, 240, 255, 0.4);
-      box-shadow: 0 0 10px rgba(0, 240, 255, 0.2);
     }
-    .btn-cyan:hover { background: rgba(0, 240, 255, 0.2); box-shadow: 0 0 16px var(--cyan-glow); }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
     @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } header { flex-direction: column; gap: 12px; align-items: flex-start; } }
     .card {
@@ -533,26 +508,25 @@ function renderTacticalDashboardHtml(hostname, uuid, client) {
     }
     .card-title {
       font-size: 14.5px; font-weight: 700; color: var(--cyan); margin-bottom: 14px;
-      display: flex; align-items: center; gap: 8px; text-shadow: 0 0 10px var(--cyan-glow);
+      display: flex; align-items: center; gap: 8px;
     }
     .item-row { display: flex; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,0.06); font-size: 13px; }
     .item-label { color: var(--muted); }
-    .item-val { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,0.8); }
+    .item-val { font-family: monospace; font-weight: 600; color: #fff; }
     .sub-box { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
     .sub-btn {
       display: flex; justify-content: space-between; align-items: center; background: rgba(255,255,255,0.06);
       border: 1px solid rgba(255,255,255,0.12); padding: 9px 14px; border-radius: 8px;
-      color: #fff; text-decoration: none; font-size: 13px; font-weight: 600; transition: all 0.2s;
+      color: #fff; text-decoration: none; font-size: 13px; font-weight: 600;
     }
     .sub-btn:hover { background: rgba(0, 240, 255, 0.15); border-color: var(--cyan); color: var(--cyan); }
     table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
     th { padding: 10px; border-bottom: 1px solid var(--glass-border); color: var(--muted); font-size: 12px; }
     td { padding: 10px; border-bottom: 1px solid rgba(255,255,255,0.05); }
-    .badge-port { background: #1e293b; color: #cbd5e1; padding: 2px 6px; border-radius: 4px; font-family: 'JetBrains Mono', monospace; }
+    .badge-port { background: #1e293b; color: #cbd5e1; padding: 2px 6px; border-radius: 4px; font-family: monospace; }
     .btn-copy { background: #1e293b; color: #f1f5f9; border: 1px solid rgba(255,255,255,0.1); padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; }
-    .btn-copy:hover { background: #334155; border-color: var(--cyan); }
     .uri-code {
-      font-family: 'JetBrains Mono', monospace; font-size: 11px; background: rgba(0,0,0,0.45);
+      font-family: monospace; font-size: 11px; background: rgba(0,0,0,0.45);
       border: 1px solid rgba(255,255,255,0.1); padding: 10px; border-radius: 8px; color: #ff9ebb;
       word-break: break-all; margin: 10px 0;
     }
@@ -575,4 +549,15 @@ function renderTacticalDashboardHtml(hostname, uuid, client) {
       </div>
       <div style="display:flex; gap:8px;">
         <button class="btn btn-cyan" onclick="switchWp()">🌸 换壁纸</button>
-        <button class="btn" onclick="copyText('${vlessMainUri}')">⚡ 复制首选
+        <button class="btn" onclick="copyText('${vlessMainUri}')">⚡ 复制首选节点链接</button>
+      </div>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <div class="card-title">🛰️ 访客网络与 Anycast 接入诊断</div>
+        <div class="item-row"><span class="item-label">出口公网 IP</span><span class="item-val">${client.clientIp}</span></div>
+        <div class="item-row"><span class="item-label">接入地区 / 城市</span><span class="item-val">${client.country} - ${client.city}</span></div>
+        <div class="item-row"><span class="item-label">自治系统 (ASN)</span><span class="item-val">AS${client.asn}</span></div>
+        <div class="item-row"><span class="item-label">识别运营商</span><span class="item-val" style="color:var(--pink); font-weight:700;">${client.carrierName}</span></div>
+        <div class="item-row"><span class="item-label">出站中继洗白引擎</span><span class="item-val" 
